@@ -31,7 +31,7 @@ class TextDataset(Dataset):
 
 # Lightning Module
 class SmolLM2Lightning(pl.LightningModule):
-    def __init__(self, vocab_size, block_size, lr, warmup_steps, max_steps, pretrained_path=None):
+    def __init__(self, vocab_size, block_size, lr, warmup_steps, max_steps, min_lr=0.0, pretrained_path=None):
         super().__init__()
         self.save_hyperparameters()
 
@@ -204,7 +204,15 @@ if __name__ == "__main__":
 
     # Step 2: Swap to pretrained weights and validate (coherent output)
     print("\n=== Pretrained Weights Validation ===")
-    pretrained_model = SmolLM2Lightning(vocab_size, block_size, max_lr, warmup_steps, max_steps, pretrained_path="HuggingFaceTB/SmolLM2-135M")
+    pretrained_model = SmolLM2Lightning(
+        vocab_size, 
+        block_size, 
+        max_lr, 
+        warmup_steps, 
+        max_steps, 
+        min_lr=min_lr,  # Added this to match optimizer
+        pretrained_path="HuggingFaceTB/SmolLM2-135M"
+        )
     """
     pretrained_trainer = pl.Trainer(
         max_steps=0,
