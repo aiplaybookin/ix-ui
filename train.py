@@ -240,3 +240,5 @@ if __name__ == "__main__":
         logger=logger
     )
     trainer.fit(pretrained_model, dataloader, val_dataloader)
+
+

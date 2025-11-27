@@ -1,0 +1,6 @@
+lightning
+pytorch-lightning
+transformers
+hf-transfer
+tensorboardX
+rich>=10.2.2
