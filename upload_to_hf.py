@@ -59,7 +59,7 @@ tokenizer = AutoTokenizer.from_pretrained("{repo_id}")
 model = AutoModelForCausalLM.from_pretrained("{repo_id}")
 
 # Generate text
-input_text = "Once upon a time"
+input_text = "Never forget who you are,"
 inputs = tokenizer(input_text, return_tensors="pt")
 outputs = model.generate(**inputs, max_new_tokens=100, do_sample=True, temperature=0.7)
 print(tokenizer.decode(outputs[0], skip_special_tokens=True))

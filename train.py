@@ -6,23 +6,36 @@ import pytorch_lightning as pl
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint, TQDMProgressBar
 from pytorch_lightning.loggers import TensorBoardLogger
 from transformers import AutoTokenizer
+from pytorch_lightning import seed_everything
 
 from config import (
     TRAIN_CONFIG, DATA_CONFIG, VOCAB_SIZE, TOKENIZER_NAME,
-    PRETRAINED_PATH, CHECKPOINT_DIR, LOG_DIR, EXPERIMENT_NAME
+    PRETRAINED_PATH, CHECKPOINT_DIR, LOG_DIR, EXPERIMENT_NAME, SEED,
+    calculate_sample_offset, calculate_tokens_processed
 )
 from dataset import TextDataset
 from model import SmolLM2Lightning
 
 
-def create_dataloaders(tokenizer):
-    """Create train and validation dataloaders."""
+def create_dataloaders(tokenizer, sample_offset: int = 0):
+    """
+    Create train and validation dataloaders.
+    
+    Args:
+        tokenizer: HuggingFace tokenizer
+        sample_offset: Starting token position (sample index = token position)
+    """
     # Training dataset
     train_dataset = TextDataset(
         DATA_CONFIG["train_file"], 
         tokenizer, 
-        TRAIN_CONFIG["block_size"]
+        TRAIN_CONFIG["block_size"],
+        token_offset=sample_offset  # This is the starting token position
     )
+    
+    if len(train_dataset) == 0:
+        raise ValueError(f"No samples remaining after offset {sample_offset}!")
+    
     train_loader = DataLoader(
         train_dataset,
         batch_size=TRAIN_CONFIG["batch_size"],
@@ -31,14 +44,17 @@ def create_dataloaders(tokenizer):
         pin_memory=True
     )
     
-    # Validation dataset (smaller)
+    # Validation dataset (no offset - validate on full data)
     val_dataset = TextDataset(
         DATA_CONFIG["train_file"],
         tokenizer,
-        block_size=DATA_CONFIG["val_block_size"]
+        block_size=DATA_CONFIG["val_block_size"],
+        token_offset=0  # Validation uses full data
     )
     val_subset_size = min(DATA_CONFIG["val_subset_size"], len(val_dataset))
-    val_dataset = Subset(val_dataset, list(range(val_subset_size)))
+    
+    if val_subset_size > 0:
+        val_dataset = Subset(val_dataset, list(range(val_subset_size)))
     
     val_loader = DataLoader(
         val_dataset,
@@ -67,11 +83,39 @@ def create_callbacks():
     return callbacks
 
 
-def train_phase1(model, train_loader, val_loader, logger):
+def get_dataset_info(tokenizer):
+    """Get dataset statistics."""
+    with open(DATA_CONFIG["train_file"], 'r') as f:
+        text = f.read()
+    total_tokens = len(tokenizer.encode(text))
+    total_samples = total_tokens - TRAIN_CONFIG["block_size"]
+    steps_per_epoch = total_samples // TRAIN_CONFIG["batch_size"]
+    
+    return {
+        "total_tokens": total_tokens,
+        "total_samples": total_samples,
+        "steps_per_epoch": steps_per_epoch,
+    }
+
+
+def train_phase1(model, train_loader, val_loader, logger, dataset_info):
     """Phase 1: Main training loop."""
     print("\n" + "=" * 60)
     print("PHASE 1: Training for {} steps".format(TRAIN_CONFIG["max_steps"]))
     print("=" * 60 + "\n")
+    
+    epochs = TRAIN_CONFIG["max_steps"] / dataset_info["steps_per_epoch"]
+    samples_to_process = TRAIN_CONFIG["max_steps"] * TRAIN_CONFIG["batch_size"]
+    
+    print(f"Dataset info:")
+    print(f"  Total tokens:      {dataset_info['total_tokens']:,}")
+    print(f"  Total samples:     {dataset_info['total_samples']:,}")
+    print(f"  Steps per epoch:   {dataset_info['steps_per_epoch']:,}")
+    print(f"Training plan:")
+    print(f"  Steps:             {TRAIN_CONFIG['max_steps']:,}")
+    print(f"  Samples to use:    {samples_to_process:,}")
+    print(f"  Epochs:            {epochs:.2f}")
+    print()
     
     trainer = pl.Trainer(
         max_steps=TRAIN_CONFIG["max_steps"],
@@ -91,16 +135,53 @@ def train_phase1(model, train_loader, val_loader, logger):
     # Save final checkpoint
     final_ckpt = f"{CHECKPOINT_DIR}/smollm2-phase1-final.ckpt"
     trainer.save_checkpoint(final_ckpt)
-    print(f"\n✅ Phase 1 complete! Checkpoint saved to: {final_ckpt}\n")
     
-    return final_ckpt
+    print(f"\n✅ Phase 1 complete!")
+    print(f"Checkpoint saved to: {final_ckpt}")
+    print(f"Steps completed: {TRAIN_CONFIG['max_steps']:,}")
+    print(f"Samples processed: {samples_to_process:,}")
+    print(f"Epochs completed: {epochs:.2f}\n")
+    
+    return final_ckpt, TRAIN_CONFIG["max_steps"]
 
 
-def train_phase2(checkpoint_path, train_loader, logger, extra_steps=50):
-    """Phase 2: Continue training from checkpoint."""
+def train_phase2(checkpoint_path, tokenizer, logger, dataset_info, completed_steps: int, extra_steps: int = 50):
+    """Phase 2: Continue training from checkpoint with remaining data."""
     print("\n" + "=" * 60)
     print(f"PHASE 2: Loading checkpoint and training for {extra_steps} more steps")
     print("=" * 60 + "\n")
+    
+    # Calculate CORRECT sample offset
+    sample_offset = calculate_sample_offset(completed_steps)
+    
+    print(f"Phase 1 stats:")
+    print(f"  Completed steps:     {completed_steps:,}")
+    print(f"  Samples processed:   {sample_offset:,}")
+    print(f"Dataset stats:")
+    print(f"  Total tokens:        {dataset_info['total_tokens']:,}")
+    print(f"  Total samples:       {dataset_info['total_samples']:,}")
+    print(f"Phase 2 plan:")
+    print(f"  Starting from token: {sample_offset:,}")
+    print(f"  Remaining tokens:    {dataset_info['total_tokens'] - sample_offset:,}")
+    print(f"  Remaining samples:   {dataset_info['total_samples'] - sample_offset:,}")
+    print()
+    
+    # Check if we have enough data
+    remaining_samples = dataset_info['total_samples'] - sample_offset
+    if remaining_samples <= 0:
+        print(f"⚠️  No data remaining! Already processed all {dataset_info['total_samples']:,} samples.")
+        print(f"To continue training, either:")
+        print(f"  1. Use a larger dataset")
+        print(f"  2. Reset offset to 0 (train another epoch on same data)")
+        return checkpoint_path
+    
+    samples_needed = extra_steps * TRAIN_CONFIG["batch_size"]
+    if remaining_samples < samples_needed:
+        print(f"⚠️  Warning: Only {remaining_samples:,} samples remaining, but {samples_needed:,} needed.")
+        print(f"Will train on available data.\n")
+    
+    # Create dataloaders with CORRECT offset
+    train_loader, val_loader = create_dataloaders(tokenizer, sample_offset=sample_offset)
     
     # Load from checkpoint
     model = SmolLM2Lightning.load_from_checkpoint(
@@ -109,10 +190,10 @@ def train_phase2(checkpoint_path, train_loader, logger, extra_steps=50):
         block_size=TRAIN_CONFIG["block_size"],
         lr=TRAIN_CONFIG["max_lr"],
         warmup_steps=TRAIN_CONFIG["warmup_steps"],
-        max_steps=TRAIN_CONFIG["max_steps"] + extra_steps,
+        max_steps=completed_steps + extra_steps,
         min_lr=TRAIN_CONFIG["min_lr"],
     )
-    print("✅ Checkpoint loaded successfully!")
+    print("✅ Checkpoint loaded successfully!\n")
     
     # Phase 2 checkpoint callback
     checkpoint_callback = ModelCheckpoint(
@@ -137,25 +218,44 @@ def train_phase2(checkpoint_path, train_loader, logger, extra_steps=50):
         logger=logger,
     )
     
-    trainer.fit(model, train_loader)
+    trainer.fit(model, train_loader, val_loader)
     
     # Save final checkpoint
     final_ckpt = f"{CHECKPOINT_DIR}/smollm2-phase2-final.ckpt"
     trainer.save_checkpoint(final_ckpt)
-    print(f"\n✅ Phase 2 complete! Checkpoint saved to: {final_ckpt}\n")
+    
+    total_steps = completed_steps + extra_steps
+    total_samples = calculate_sample_offset(total_steps)
+    
+    print(f"\n✅ Phase 2 complete!")
+    print(f"Checkpoint saved to: {final_ckpt}")
+    print(f"Total steps completed: {total_steps:,}")
+    print(f"Total samples processed: {total_samples:,}\n")
     
     return final_ckpt
 
 
 def main():
+    seed_everything(SEED, workers=True)
+
     # Set precision
     torch.set_float32_matmul_precision('high')
     
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
     
-    # Create dataloaders
-    train_loader, val_loader = create_dataloaders(tokenizer)
+    # Get dataset info
+    dataset_info = get_dataset_info(tokenizer)
+    
+    print("\n" + "=" * 60)
+    print("DATASET INFORMATION")
+    print("=" * 60)
+    print(f"Total tokens:        {dataset_info['total_tokens']:,}")
+    print(f"Total samples:       {dataset_info['total_samples']:,}")
+    print(f"Steps per epoch:     {dataset_info['steps_per_epoch']:,}")
+    print(f"Block size:          {TRAIN_CONFIG['block_size']}")
+    print(f"Batch size:          {TRAIN_CONFIG['batch_size']}")
+    print("=" * 60 + "\n")
     
     # Create logger
     logger = TensorBoardLogger(LOG_DIR, name=EXPERIMENT_NAME)
@@ -179,8 +279,10 @@ def main():
     print(pretrained_model)
     
     # ============================================================
-    # PHASE 1: Train from scratch
+    # PHASE 1: Train from scratch (sample_offset = 0)
     # ============================================================
+    train_loader, val_loader = create_dataloaders(tokenizer, sample_offset=0)
+    
     model = SmolLM2Lightning(
         vocab_size=VOCAB_SIZE,
         block_size=TRAIN_CONFIG["block_size"],
@@ -191,15 +293,27 @@ def main():
         pretrained_path=None  # Train from scratch
     )
     
-    phase1_ckpt = train_phase1(model, train_loader, val_loader, logger)
+    phase1_ckpt, completed_steps = train_phase1(model, train_loader, val_loader, logger, dataset_info)
     
     # ============================================================
-    # PHASE 2: Continue training
+    # PHASE 2: Continue training with REMAINING data
     # ============================================================
-    phase2_ckpt = train_phase2(phase1_ckpt, train_loader, logger, extra_steps=50)
+    logger = TensorBoardLogger(LOG_DIR, name=EXPERIMENT_NAME+"_phase2")
+
+    phase2_ckpt = train_phase2(
+        phase1_ckpt, 
+        tokenizer, 
+        logger,
+        dataset_info,
+        completed_steps=completed_steps,
+        extra_steps=50
+    )
     
-    print("\n✅ All training phases complete!")
+    print("\n" + "=" * 60)
+    print("✅ ALL TRAINING PHASES COMPLETE!")
+    print("=" * 60)
     print(f"Final checkpoint: {phase2_ckpt}")
+    print("=" * 60 + "\n")
 
 
 if __name__ == "__main__":

@@ -51,9 +51,28 @@ CHECKPOINT_DIR = "checkpoints/"
 LOG_DIR = "logs/"
 EXPERIMENT_NAME = "smollm2_experiment"
 
+# SEED
+SEED = 42
+
 # Hugging Face upload settings
 HF_CONFIG = {
     "username": "vikashkr117",
     "model_name": "smollm2-135m-raw-trained",
     "private": False,
 }
+
+def calculate_sample_offset(steps: int) -> int:
+    """
+    Calculate the correct sample/token offset based on steps completed.
+    
+    Sample index = Token starting position (due to sliding window)
+    """
+    return steps * TRAIN_CONFIG["batch_size"]
+
+
+def calculate_tokens_processed(steps: int) -> int:
+    """
+    Calculate total token POSITIONS processed (for reporting only).
+    Note: This counts overlapping positions, not unique tokens.
+    """
+    return steps * TRAIN_CONFIG["batch_size"] * TRAIN_CONFIG["block_size"]
